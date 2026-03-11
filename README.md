@@ -1,6 +1,6 @@
 # ⚽ Aggressivity Stats — Analizador de Agresividad de La Liga
 
-Herramienta de análisis estadístico para **La Liga Española** que calcula índices de agresividad, predice faltas esperadas (xFouls) y perfila el estilo de juego de cada equipo. Pensada para apostadores, analistas y aficionados que quieren evaluar el riesgo disciplinario de los partidos.
+Herramienta de análisis estadístico para **La Liga Española** que calcula índices de agresividad, predice faltas esperadas (xFouls) y perfila el estilo de juego de cada equipo.
 
 ## 📋 ¿Qué hace este proyecto?
 
