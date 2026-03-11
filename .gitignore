@@ -1,0 +1,29 @@
+# Credenciales y configuración local (NUNCA subir)
+config.py
+
+# Caché de datos
+cache_partidos.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Windows: nul es dispositivo reservado
+nul
