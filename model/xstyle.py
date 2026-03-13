@@ -13,6 +13,7 @@ from config import DECAY_LAMBDA
 from model.helpers import parse_date, decay_weight, safe
 
 STYLE_DIMS = [
+    ("posesion", "Posesión"),
     ("tiros", "Tiros/P"),
     ("precision", "Precisión tiro"),
     ("corners", "Corners/P"),
@@ -75,6 +76,7 @@ def calcular_xstyle(partidos: list[dict]) -> dict:
                 acum[nombre] = {k: 0.0 for k in [
                     "f_w", "y_w", "r_w", "sh_w", "sh_ot_w", "co_w",
                     "gf_w", "ga_w", "drawn_w", "w",
+                    "poss_w", "poss_n_w",
                 ]}
                 acum[nombre]["n"] = 0
 
@@ -90,6 +92,11 @@ def calcular_xstyle(partidos: list[dict]) -> dict:
             a["drawn_w"] += safe(opp.get("fouls")) * peso
             a["w"] += peso
             a["n"] += 1
+
+            poss = team.get("possession")
+            if poss is not None:
+                a["poss_w"] += float(poss) * peso
+                a["poss_n_w"] += peso
 
     raw: dict = {}
     for nombre, a in acum.items():
@@ -113,11 +120,14 @@ def calcular_xstyle(partidos: list[dict]) -> dict:
         ratio_fis = fouls / (fouls + shots) if (fouls + shots) > 0 else 0.5
         tempo = fouls + shots + corners * 0.5
 
+        poss_avg = a["poss_w"] / a["poss_n_w"] if a["poss_n_w"] > 0 else None
+
         estilo, desc = _clasificar_estilo(
             fouls, shots, precision, set_piece_r, ratio_fis, goals, goals_c,
         )
 
         raw[nombre] = {
+            "posesion": round(poss_avg, 1) if poss_avg is not None else None,
             "tiros": round(shots, 1),
             "tiros_a_puerta": round(shots_ot, 1),
             "corners": round(corners, 1),
@@ -145,6 +155,7 @@ def calcular_xstyle(partidos: list[dict]) -> dict:
 def _normalizar_dims(raw: dict) -> None:
     """Normaliza dimensiones de estilo a escala 1-10 relativa a la liga."""
     dims = {
+        "posesion": ("posesion", True),
         "tiros": ("tiros", True),
         "precision": ("precision", True),
         "corners": ("corners", True),
@@ -155,12 +166,17 @@ def _normalizar_dims(raw: dict) -> None:
         "faltas_prov": ("faltas_prov", True),
     }
     for dim_key, (campo, higher_is_more) in dims.items():
-        valores = [raw[n][campo] for n in raw]
+        valores = [raw[n][campo] for n in raw if raw[n][campo] is not None]
+        if not valores:
+            continue
         min_v, max_v = min(valores), max(valores)
         rng = max_v - min_v if max_v != min_v else 1.0
         for nombre in raw:
             v = raw[nombre][campo]
-            norm = 1 + ((v - min_v) / rng) * 9 if higher_is_more else 1 + ((max_v - v) / rng) * 9
             if "dim_norm" not in raw[nombre]:
                 raw[nombre]["dim_norm"] = {}
+            if v is None:
+                raw[nombre]["dim_norm"][dim_key] = None
+                continue
+            norm = 1 + ((v - min_v) / rng) * 9 if higher_is_more else 1 + ((max_v - v) / rng) * 9
             raw[nombre]["dim_norm"][dim_key] = round(norm, 1)

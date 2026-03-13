@@ -54,12 +54,21 @@ def _row_to_supabase(row: dict, season: int) -> Optional[dict]:
     season_s = _season_str(season)
     match_id = f"fdc_{season_s}_{fecha}_{home}_{away}"
 
+    def _safe_odds(key: str) -> Optional[float]:
+        v = row.get(key, "").strip()
+        try:
+            f = float(v)
+            return f if f > 1.0 else None
+        except (ValueError, TypeError):
+            return None
+
     return {
         "match_id": match_id,
         "season": season_s,
         "match_date": fecha,
         "home_team": home,
         "away_team": away,
+        "referee": row.get("Referee", "").strip() or None,
         "fouls_home": int(hf),
         "fouls_away": int(af),
         "fouls_total": int(hf) + int(af),

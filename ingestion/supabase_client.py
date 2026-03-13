@@ -27,6 +27,7 @@ def _row_to_partido(row: dict) -> dict:
             "shots_on_target": row.get("shots_on_target_home") or 0,
             "corners": row.get("corners_home") or 0,
             "goals": row.get("home_goals") or 0,
+            "possession": row.get("possession_home"),
         },
         "away": {
             "name": row["away_team"],
@@ -37,6 +38,7 @@ def _row_to_partido(row: dict) -> dict:
             "shots_on_target": row.get("shots_on_target_away") or 0,
             "corners": row.get("corners_away") or 0,
             "goals": row.get("away_goals") or 0,
+            "possession": row.get("possession_away"),
         },
     }
 
@@ -71,7 +73,8 @@ def fetch_all_matches() -> list[dict]:
         "fouls_home,fouls_away,yellows_home,yellows_away,"
         "reds_home,reds_away,shots_home,shots_away,"
         "shots_on_target_home,shots_on_target_away,"
-        "corners_home,corners_away"
+        "corners_home,corners_away,"
+        "possession_home,possession_away"
     )
     rows = _paginate_select(sb, "matches", cols, order="match_date")
     return [_row_to_partido(r) for r in rows]

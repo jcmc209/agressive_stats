@@ -28,6 +28,7 @@ def calcular_xfouls(
     equipo_local: str,
     equipo_visitante: str,
     arbitro: Optional[str] = None,
+    alpha_card_pressure: Optional[float] = None,
 ) -> dict:
     """Calcula las faltas esperadas en un partido concreto."""
     hoy = date.today()
@@ -77,6 +78,8 @@ def calcular_xfouls(
         den = d.get("d_den", 0)
         return d["d_num"] / den if den > 0 else avg_equipo
 
+    alpha_cp = ALPHA_CARD_PRESSURE if alpha_card_pressure is None else alpha_card_pressure
+
     def card_pressure(nombre: str) -> float:
         d = t.get(nombre, {})
         n = d.get("n", 0)
@@ -86,7 +89,7 @@ def calcular_xfouls(
         fr = fouls_rate(nombre)
         ratio = yr / fr if fr > 0 else RATIO_AMARILLAS_FALTA_AVG
         exceso = max(0.0, ratio - RATIO_AMARILLAS_FALTA_AVG)
-        return max(0.80, 1.0 - ALPHA_CARD_PRESSURE * exceso)
+        return max(0.80, 1.0 - alpha_cp * exceso)
 
     ref_factor = 1.0
     arbitro_info: Optional[dict] = None

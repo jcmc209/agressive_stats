@@ -35,7 +35,10 @@ from model import (
     calcular_xfouls, calcular_xstyle,
     calcular_perfiles_arbitros, buscar_arbitro,
     nivel_intensidad, STYLE_DIMS,
+    ensamblar_knowledge_pack, ajustar_knowledge_pack,
 )
+from model.evaluate_knowledge import evaluar as evaluar_knowledge
+from model.calibrate_agresividad import calibrar_agresividad_volumen
 
 # ── Colores ANSI ─────────────────────────────────────────────────────────────
 RESET   = "\033[0m"
@@ -229,6 +232,10 @@ def _construir_resultado(
     scores: dict, rankings: dict,
     xstyles: dict, partidos: list,
     arbitro: Optional[str],
+    jornada: Optional[int] = None,
+    cuotas: Optional[dict] = None,
+    contexto_competitivo: Optional[dict] = None,
+    market_input: Optional[dict] = None,
 ) -> dict:
     sa = scores[equipo_a]
     sb = scores[equipo_b]
@@ -237,6 +244,7 @@ def _construir_resultado(
     n  = len(scores)
 
     xf = calcular_xfouls(partidos, equipo_a, equipo_b, arbitro)
+    perfiles_refs = calcular_perfiles_arbitros(partidos)
     etiqueta_riesgo, _ = nivel_riesgo(sa["general_norm"], sb["general_norm"])
     etiqueta_int, _    = nivel_intensidad(xf["xfouls_total"], xf["avg_liga"])
 
@@ -261,9 +269,11 @@ def _construir_resultado(
 
     def style_dict(nombre: str) -> dict:
         p = xstyles.get(nombre, {})
+        poss = p.get("posesion")
         return {
             "estilo":      p.get("estilo", "—"),
             "estilo_desc": p.get("estilo_desc", ""),
+            "posesion":    round(poss, 1) if poss is not None else None,
             "tiros":       round(p.get("tiros", 0), 1),
             "precision":   round(p.get("precision", 0) * 100, 1),
             "corners":     round(p.get("corners", 0), 1),
@@ -277,11 +287,34 @@ def _construir_resultado(
     diff_pct = (xf["xfouls_total"] - xf["avg_liga"]) / xf["avg_liga"] * 100
     xf_arb = xf.get("arbitro")
 
+    knowledge_pack = ensamblar_knowledge_pack(
+        equipo_local=equipo_a,
+        equipo_visitante=equipo_b,
+        partidos=partidos,
+        xstyles=xstyles,
+        xfouls_result=xf,
+        ref_perfiles=perfiles_refs,
+        arbitro=arbitro,
+        jornada=jornada,
+        contexto_competitivo_input=contexto_competitivo,
+    )
+    if cuotas or market_input:
+        knowledge_pack = ajustar_knowledge_pack(
+            knowledge_pack,
+            odds_h=cuotas.get("local") if cuotas else None,
+            odds_d=cuotas.get("empate") if cuotas else None,
+            odds_a=cuotas.get("visitante") if cuotas else None,
+            odds_over25=cuotas.get("over25") if cuotas else None,
+            odds_under25=cuotas.get("under25") if cuotas else None,
+            market_input=market_input,
+        )
+
     return {
         "generado":          datetime.now().isoformat(timespec="seconds"),
         "equipo_local":      equipo_a,
         "equipo_visitante":  equipo_b,
         "arbitro":           arbitro,
+        "jornada":           jornada,
         "iap": {
             "local":       equipo_dict(equipo_a, sa, ra),
             "visitante":   equipo_dict(equipo_b, sb, rb),
@@ -310,6 +343,7 @@ def _construir_resultado(
             "local":     style_dict(equipo_a),
             "visitante": style_dict(equipo_b),
         },
+        "knowledge_pack": knowledge_pack,
     }
 
 
@@ -335,7 +369,7 @@ def _generar_markdown(r: dict) -> str:
         "",
         "---",
         "",
-        "## Índice de Agresividad (IAP)",
+        "## Índice IAP (histórico, señal secundaria)",
         "",
         f"| | **{ea}** | **{eb}** |",
         "|---|---:|---:|",
@@ -384,6 +418,7 @@ def _generar_markdown(r: dict) -> str:
         "",
         f"| Dimensión | Valor |",
         "|---|---:|",
+        f"| Posesión | {sa['posesion']}% |" if sa['posesion'] is not None else "| Posesión | — |",
         f"| Tiros/P | {sa['tiros']} |",
         f"| Precisión tiro | {sa['precision']}% |",
         f"| Corners/P | {sa['corners']} |",
@@ -398,6 +433,7 @@ def _generar_markdown(r: dict) -> str:
         "",
         f"| Dimensión | Valor |",
         "|---|---:|",
+        f"| Posesión | {sb['posesion']}% |" if sb['posesion'] is not None else "| Posesión | — |",
         f"| Tiros/P | {sb['tiros']} |",
         f"| Precisión tiro | {sb['precision']}% |",
         f"| Corners/P | {sb['corners']} |",
@@ -406,6 +442,171 @@ def _generar_markdown(r: dict) -> str:
         f"| Faltas/P | {sb['faltas']} |",
         f"| Tarjetas/Falta | {sb['tarj_falta']} |",
         f"| Faltas provocadas | {sb['faltas_prov']} |",
+    ]
+
+    # ── Knowledge Pack ────────────────────────────────────────────────────────
+    kp = r.get("knowledge_pack")
+    if kp:
+        forma_l = kp["forma"]["local"]
+        forma_v = kp["forma"]["visitante"]
+        ctx = kp["contexto_temporada"]
+        xg = kp["expected_metrics"]["xgoals"]
+        xposs = kp["expected_metrics"]["xposesion"]
+        xtarj = kp["expected_metrics"]["xtarjetas"]
+        aggv = kp["expected_metrics"]["agresividad_volumen"]
+        compat = kp["compatibilidad_estilos"]
+        ccomp = kp.get("contexto_competitivo", {})
+        narrative = kp.get("narrative", [])
+        jornada_val = r.get("jornada")
+
+        def _racha_forma(forma: dict) -> str:
+            if forma["partidos_analizados"] == 0:
+                return "—"
+            return (
+                f"{forma['racha_str']} "
+                f"({forma['victorias']}V {forma['empates']}E {forma['derrotas']}D, "
+                f"{forma['puntos']} pts, {forma['tendencia']})"
+            )
+
+        lines += [
+            "",
+            "---",
+            "",
+            "## Knowledge Pack — Análisis Prepartido",
+            "",
+            f"### Contexto de temporada",
+            "",
+            f"| | |",
+            "|---|---:|",
+            f"| Jornada estimada | ~{ctx['jornada_estimada']}/{ctx['jornadas_totales']} "
+            f"({ctx['porcentaje_temporada']}%) |" if jornada_val is None
+            else f"| Jornada | {ctx['jornada_estimada']}/{ctx['jornadas_totales']} "
+            f"({ctx['porcentaje_temporada']}%) |",
+            f"| Tramo | {ctx['tramo_desc']} |",
+            f"| Jornadas restantes | {ctx['jornadas_restantes']} |",
+            f"| Presión de cierre | **{ctx['presion_final'].upper()}** |",
+            "",
+            "### Forma reciente",
+            "",
+            f"| | **{ea}** | **{eb}** |",
+            "|---|:---:|:---:|",
+            f"| Últimos partidos | {forma_l['partidos_analizados']} | {forma_v['partidos_analizados']} |",
+            f"| Racha (reciente→antigua) | {_racha_forma(forma_l)} | {_racha_forma(forma_v)} |",
+            f"| Puntos/partido | {forma_l['puntos_media']} | {forma_v['puntos_media']} |",
+            f"| Goles anotados/P | {forma_l['goles_anotados_media']} | {forma_v['goles_anotados_media']} |",
+            f"| Goles recibidos/P | {forma_l['goles_recibidos_media']} | {forma_v['goles_recibidos_media']} |",
+            f"| Faltas/P (forma) | {forma_l['faltas_media']} | {forma_v['faltas_media']} |",
+            f"| Tarjetas/P (forma) | {forma_l['tarjetas_media']} | {forma_v['tarjetas_media']} |",
+            "",
+            "### Tipo de partido esperado",
+            "",
+            f"**{compat['tipo_partido']}** — {compat['tipo_partido_desc']}",
+            "",
+            f"| | |",
+            "|---|---:|",
+            f"| Intensidad física | {compat['fisico_total']} F/P combinadas ({compat['fisico_label']}) |",
+            f"| Ritmo ofensivo | {compat['ritmo_ofensivo']} tiros/P combinados ({compat['ofensivo_label']}) |",
+            f"| Control del juego | {compat['control_juego']} |",
+            f"| Estilo {ea} | {compat['estilos']['local']} |",
+            f"| Estilo {eb} | {compat['estilos']['visitante']} |",
+        ]
+
+        if compat["derived_angles"]:
+            lines += [
+                "",
+                f"**Ángulos detectados:** {' · '.join(compat['derived_angles'])}",
+            ]
+
+        if ccomp:
+            ccl = ccomp.get("local", {})
+            ccv = ccomp.get("visitante", {})
+            lines += [
+                "",
+                "### Contexto competitivo",
+                "",
+                f"| Factor | {ea} | {eb} |",
+                "|---|:---:|:---:|",
+                f"| ICC competitivo | {ccl.get('scores', {}).get('icc', 0)} | {ccv.get('scores', {}).get('icc', 0)} |",
+                f"| Última competición | {ccl.get('last_competition', 'none')} | {ccv.get('last_competition', 'none')} |",
+                f"| Próxima competición | {ccl.get('next_competition', 'none')} | {ccv.get('next_competition', 'none')} |",
+                f"| Objetivo liga | {ccl.get('objetivo_liga', 'none')} | {ccv.get('objetivo_liga', 'none')} |",
+                f"| Lectura | {ccl.get('lectura', '—')} | {ccv.get('lectura', '—')} |",
+            ]
+
+        lines += [
+            "",
+            "### Métricas esperadas",
+            "",
+            f"| Métrica | {ea} | {eb} | Total |",
+            "|---|:---:|:---:|:---:|",
+            f"| xGoals | {xg['xg_local']} | {xg['xg_visitante']} | {xg['xg_total']} |",
+            f"| Posesión esperada | {xposs['posesion_local']}% | {xposs['posesion_visitante']}% | — |",
+            f"| xFaltas | {kp['expected_metrics']['xfouls']['local']} | "
+            f"{kp['expected_metrics']['xfouls']['visitante']} | "
+            f"{kp['expected_metrics']['xfouls']['total']} |",
+            f"| Agresividad volumen | {aggv['local']} | {aggv['visitante']} | {aggv['total']} |",
+            f"| xTarjetas amarillas | {xtarj['xtarjetas_local']} | "
+            f"{xtarj['xtarjetas_visitante']} | {xtarj['xtarjetas_total']:.2f} |",
+            f"| xRojas (estimadas) | — | — | {xtarj['xrojas_total']:.3f} |",
+            "",
+            "### Probabilidades derivadas (Poisson)",
+            "",
+            f"| Mercado | Probabilidad modelo |",
+            "|---|:---:|",
+            f"| {ea} gana | **{xg['prob_local_win']*100:.1f}%** |",
+            f"| Empate | **{xg['prob_draw']*100:.1f}%** |",
+            f"| {eb} gana | **{xg['prob_visitante_win']*100:.1f}%** |",
+            f"| Over 2.5 goles | **{xg['prob_over25']*100:.1f}%** |",
+            f"| Under 2.5 goles | **{xg['prob_under25']*100:.1f}%** |",
+            f"| BTTS (ambos marcan) | **{xg['prob_btts']*100:.1f}%** |",
+        ]
+
+        # Market signal
+        ms = kp.get("market_signal")
+        if ms:
+            lines += ["", "### Señal de mercado", ""]
+            if ms.get("alignment"):
+                al = ms["alignment"]
+                cuotas_md = ms["cuotas_1x2"]
+                pm = ms["probabilidades_mercado_1x2"]
+                pmod = ms["probabilidades_modelo_1x2"]
+                lines += [
+                    f"| | Cuota | P. mercado | P. modelo | Diferencia |",
+                    "|---|:---:|:---:|:---:|:---:|",
+                    f"| {ea} gana | {cuotas_md['local']} | {pm['prob_local']*100:.1f}% | "
+                    f"{pmod['prob_local']*100:.1f}% | {(pmod['prob_local']-pm['prob_local'])*100:+.1f}pp |",
+                    f"| Empate | {cuotas_md['empate']} | {pm['prob_draw']*100:.1f}% | "
+                    f"{pmod['prob_draw']*100:.1f}% | {(pmod['prob_draw']-pm['prob_draw'])*100:+.1f}pp |",
+                    f"| {eb} gana | {cuotas_md['visitante']} | {pm['prob_visitante']*100:.1f}% | "
+                    f"{pmod['prob_visitante']*100:.1f}% | {(pmod['prob_visitante']-pm['prob_visitante'])*100:+.1f}pp |",
+                    "",
+                    f"**Alignment 1X2:** {al['alignment_score']} — {al['interpretacion']}",
+                ]
+            if "over25" in ms:
+                ov = ms["over25"]
+                lines += [
+                    f"**Over 2.5:** cuota {ov['cuota_over']} · "
+                    f"P.mercado {ov['prob_mercado']*100:.1f}% · "
+                    f"P.modelo {ov['prob_modelo']*100:.1f}% · "
+                    f"diferencia {ov['diferencia']*100:+.1f}pp — {ov['interpretacion']}",
+                ]
+            if ms.get("markets"):
+                lines += ["", "**Mercados disponibles:** " + ", ".join(ms.get("available_markets", []))]
+                gal = ms.get("global_alignment")
+                if gal:
+                    lines += [f"**Alignment global:** {gal['score']} ({gal['n_markets']} mercados) — {gal['interpretacion']}"]
+
+        # Narrative
+        if narrative:
+            lines += [
+                "",
+                "### Narrative (knowledge bullets)",
+                "",
+            ]
+            for bullet in narrative:
+                lines.append(f"- {bullet}")
+
+    lines += [
         "",
         "---",
         f"*Generado: {r['generado']}*",
@@ -427,13 +628,134 @@ def _guardar_resultado(r: dict) -> tuple[Path, Path]:
     return path_json, path_md
 
 
+def _imprimir_knowledge_pack(kp: dict, equipo_a: str, equipo_b: str) -> None:
+    """Muestra en consola el knowledge pack de forma legible."""
+    sep = f"{GRAY}  {'─' * 56}{RESET}"
+
+    print(f"\n{BOLD}{CYAN}{'═' * 58}{RESET}")
+    print(f"{BOLD}{CYAN}  KNOWLEDGE PACK — ANÁLISIS PREPARTIDO{RESET}")
+    print(f"{sep}")
+
+    # Contexto temporada
+    ctx = kp["contexto_temporada"]
+    print(f"\n  {BOLD}Contexto temporada:{RESET}  "
+          f"Jornada ~{ctx['jornada_estimada']}/38  "
+          f"{GRAY}({ctx['tramo_desc']}){RESET}")
+    print(f"  Quedan {ctx['jornadas_restantes']} jornadas  "
+          f"· Presión de cierre: {BOLD}{ctx['presion_final'].upper()}{RESET}")
+
+    # Forma reciente
+    print(f"\n  {BOLD}Forma reciente:{RESET}")
+
+    def _forma_row(nombre: str, forma: dict) -> None:
+        if forma["partidos_analizados"] == 0:
+            print(f"  {nombre:<22}  {GRAY}sin datos{RESET}")
+            return
+        tend_color = GREEN if forma["tendencia"] == "mejorando" else (
+            RED if forma["tendencia"] == "empeorando" else GRAY)
+        print(f"  {nombre:<22}  {BOLD}{forma['racha_str']}{RESET}  "
+              f"{GRAY}({forma['victorias']}V {forma['empates']}E {forma['derrotas']}D · "
+              f"{forma['puntos']} pts){RESET}  "
+              f"{tend_color}{forma['tendencia']}{RESET}")
+
+    _forma_row(equipo_a, kp["forma"]["local"])
+    _forma_row(equipo_b, kp["forma"]["visitante"])
+
+    # Tipo de partido
+    compat = kp["compatibilidad_estilos"]
+    print(f"\n  {BOLD}Tipo de partido esperado:{RESET}")
+    print(f"  {CYAN}{BOLD}{compat['tipo_partido']}{RESET}  {GRAY}— {compat['tipo_partido_desc']}{RESET}")
+    print(f"  Físico: {compat['fisico_label']}  "
+          f"· Ofensivo: {compat['ofensivo_label']}  "
+          f"· {compat['control_juego']}")
+
+    if compat["derived_angles"]:
+        angles = " · ".join(compat["derived_angles"])
+        print(f"  {GRAY}Ángulos: {angles}{RESET}")
+
+    # Métricas esperadas
+    em = kp["expected_metrics"]
+    xg = em["xgoals"]
+    xposs = em["xposesion"]
+    xtarj = em["xtarjetas"]
+    aggv = em["agresividad_volumen"]
+    xfl = em["xfouls"]
+    ccomp = kp.get("contexto_competitivo", {})
+
+    print(f"\n  {BOLD}Métricas esperadas:{RESET}")
+    print(f"  {'':24}  {BLUE}{equipo_a:<20}{RESET}  {MAGENTA}{equipo_b}{RESET}")
+    print(f"  {GRAY}{'─' * 56}{RESET}")
+    print(f"  {'xGoals':<24}  {BLUE}{xg['xg_local']:>6.2f}{RESET}              "
+          f"{MAGENTA}{xg['xg_visitante']:>6.2f}{RESET}")
+    print(f"  {'Posesión esperada':<24}  {BLUE}{xposs['posesion_local']:>5.1f}%{RESET}             "
+          f"{MAGENTA}{xposs['posesion_visitante']:>5.1f}%{RESET}")
+    print(f"  {'xFaltas':<24}  {BLUE}{xfl['local']:>6.1f}{RESET}              "
+          f"{MAGENTA}{xfl['visitante']:>6.1f}{RESET}   total {BOLD}{xfl['total']:.1f}{RESET}")
+    print(f"  {'Agresividad volumen':<24}  {BLUE}{aggv['local']:>6.2f}{RESET}              "
+          f"{MAGENTA}{aggv['visitante']:>6.2f}{RESET}   total {BOLD}{aggv['total']:.2f}{RESET}")
+    print(f"  {'xTarjetas amarillas':<24}  {BLUE}{xtarj['xtarjetas_local']:>6.2f}{RESET}              "
+          f"{MAGENTA}{xtarj['xtarjetas_visitante']:>6.2f}{RESET}   total {BOLD}{xtarj['xtarjetas_total']:.2f}{RESET}")
+    print(f"  {'xRojas (estimadas)':<24}  {'total':>26}  {BOLD}{xtarj['xrojas_total']:.3f}{RESET}")
+    if ccomp:
+        ccl = ccomp.get("local", {})
+        ccv = ccomp.get("visitante", {})
+        print(f"  {'ICC competitivo':<24}  {BLUE}{ccl.get('scores', {}).get('icc', 0):>6.2f}{RESET}              "
+              f"{MAGENTA}{ccv.get('scores', {}).get('icc', 0):>6.2f}{RESET}")
+        print(f"  {'Comp. siguiente':<24}  {BLUE}{ccl.get('next_competition', 'none'):>6}{RESET}              "
+              f"{MAGENTA}{ccv.get('next_competition', 'none'):>6}{RESET}")
+        print(f"  {'Objetivo liga':<24}  {BLUE}{ccl.get('objetivo_liga', 'none'):>6}{RESET}              "
+              f"{MAGENTA}{ccv.get('objetivo_liga', 'none'):>6}{RESET}")
+
+    # Probabilidades
+    print(f"\n  {BOLD}Probabilidades derivadas (Poisson):{RESET}")
+    print(f"  Local {BOLD}{xg['prob_local_win']*100:.0f}%{RESET}  "
+          f"· Empate {BOLD}{xg['prob_draw']*100:.0f}%{RESET}  "
+          f"· Visitante {BOLD}{xg['prob_visitante_win']*100:.0f}%{RESET}")
+    over_color = GREEN if xg["prob_over25"] >= 0.5 else YELLOW
+    print(f"  Over 2.5: {over_color}{BOLD}{xg['prob_over25']*100:.0f}%{RESET}  "
+          f"· Under 2.5: {BOLD}{xg['prob_under25']*100:.0f}%{RESET}  "
+          f"· BTTS: {BOLD}{xg['prob_btts']*100:.0f}%{RESET}")
+
+    # Market signal
+    ms = kp.get("market_signal")
+    if ms:
+        al = ms.get("alignment")
+        if al:
+            al_score = al["alignment_score"]
+            al_color = GREEN if al_score >= 0.80 else (YELLOW if al_score >= 0.60 else RED)
+            print(f"\n  {BOLD}Señal de mercado:{RESET}  "
+                  f"{al_color}Alignment {al_score:.2f}{RESET}  "
+                  f"{GRAY}— {al['interpretacion']}{RESET}")
+        gal = ms.get("global_alignment")
+        if gal:
+            print(f"  {GRAY}Global ({gal['n_markets']} mercados): "
+                  f"{gal['score']} — {gal['interpretacion']}{RESET}")
+
+    # Narrative
+    narrative = kp.get("narrative", [])
+    if narrative:
+        print(f"\n  {BOLD}Narrative (knowledge bullets):{RESET}")
+        for bullet in narrative:
+            print(f"    {GRAY}{bullet}{RESET}")
+
+    print(f"{BOLD}{CYAN}{'═' * 58}{RESET}\n")
+
+
 def mostrar_enfrentamiento(
     equipo_a: str, equipo_b: str,
     scores: dict, rankings: dict,
     xstyles: dict, partidos: list,
     arbitro: Optional[str] = None,
+    jornada: Optional[int] = None,
+    cuotas: Optional[dict] = None,
+    contexto_competitivo: Optional[dict] = None,
+    market_input: Optional[dict] = None,
 ) -> None:
-    resultado = _construir_resultado(equipo_a, equipo_b, scores, rankings, xstyles, partidos, arbitro)
+    resultado = _construir_resultado(
+        equipo_a, equipo_b, scores, rankings, xstyles, partidos, arbitro,
+        jornada=jornada, cuotas=cuotas, contexto_competitivo=contexto_competitivo,
+        market_input=market_input,
+    )
     path_json, path_md = _guardar_resultado(resultado)
 
     iap = resultado["iap"]
@@ -448,7 +770,7 @@ def mostrar_enfrentamiento(
     print(f"{BOLD}{CYAN}  {equipo_a}  vs  {equipo_b}{RESET}")
     print(f"{BOLD}{CYAN}{'═' * 58}{RESET}\n")
 
-    print(f"  {BOLD}IAP (Agresividad){RESET}")
+    print(f"  {BOLD}IAP (histórico de contacto, secundario){RESET}")
     print(f"  {BLUE}{equipo_a:<22}{RESET}  "
           f"{BOLD}{ia['iap_general']:4.1f}/10{RESET}  "
           f"L {ia['iap_local']:.1f}  V {ia['iap_visitante']:.1f}  "
@@ -472,7 +794,12 @@ def mostrar_enfrentamiento(
         xa = xf["arbitro"]
         print(f"\n  {BOLD}Árbitro:{RESET} {xa['nombre']} — {xa['tipo'].upper()}")
 
-    print(f"\n{BOLD}{CYAN}{'═' * 58}{RESET}")
+    kp = resultado.get("knowledge_pack")
+    if kp:
+        _imprimir_knowledge_pack(kp, equipo_a, equipo_b)
+    else:
+        print(f"\n{BOLD}{CYAN}{'═' * 58}{RESET}")
+
     print(f"  {GREEN}✓ Guardado en:{RESET}")
     print(f"    {path_json.relative_to(Path.cwd()) if path_json.is_relative_to(Path.cwd()) else path_json}")
     print(f"    {path_md.relative_to(Path.cwd()) if path_md.is_relative_to(Path.cwd()) else path_md}")
@@ -550,31 +877,116 @@ def modo_interactivo(scores: dict, rankings: dict, xstyles: dict, partidos: list
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analizador de Agresividad + xFouls + xStyle — La Liga Española",
+        description="Analizador de Agresividad + Knowledge Pack — La Liga Española",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
-  python main.py                                    # Modo interactivo (selector numerico)
-  python main.py 2 15                               # Por numero de la lista (--equipos)
-  python main.py "Athletic" "Atletico"              # Por nombre (busqueda aproximada)
-  python main.py "Getafe" "Barca" --arbitro "Gil"   # Con arbitro
-  python main.py --ranking                          # Ranking de agresividad
-  python main.py --equipos                          # Listar equipos numerados
-  python main.py --arbitros                         # Listar arbitros con estadisticas
-  python main.py --ingest stats                     # CSVs -> Supabase
-  python main.py --ingest possession                # Scrape fbref -> Supabase
-  python main.py --ingest all                       # stats + possession
+  python main.py                                          # Modo interactivo
+  python main.py "Getafe" "Barca"                        # Por nombre
+  python main.py "Getafe" "Barca" --arbitro "Gil"        # Con árbitro
+  python main.py "Getafe" "Barca" --jornada 28           # Con jornada exacta
+  python main.py "Real Madrid" "Barca" \\
+    --cuota-local 2.10 --cuota-empate 3.40 --cuota-vis 3.20  # Con cuotas 1X2
+  python main.py "Real Madrid" "Barca" \\
+    --cuota-local 2.10 --cuota-empate 3.40 --cuota-vis 3.20 \\
+    --cuota-over25 1.85 --cuota-under25 1.95              # Con cuotas O/U
+  python main.py --ranking                               # Ranking de agresividad
+  python main.py --equipos                               # Listar equipos numerados
+  python main.py --arbitros                              # Listar árbitros
+  python main.py --ingest stats                          # CSVs -> Supabase
+  python main.py --ingest possession                     # Scrape fbref -> Supabase
+  python main.py --ingest all                            # stats + possession
         """
     )
-    parser.add_argument("equipo_a", nargs="?", help="Primer equipo")
-    parser.add_argument("equipo_b", nargs="?", help="Segundo equipo")
+    parser.add_argument("equipo_a", nargs="?", help="Primer equipo (local)")
+    parser.add_argument("equipo_b", nargs="?", help="Segundo equipo (visitante)")
     parser.add_argument("--ranking",   action="store_true", help="Mostrar ranking completo")
     parser.add_argument("--equipos",   action="store_true", help="Listar equipos disponibles")
     parser.add_argument("--arbitros",  action="store_true", help="Listar árbitros con estadísticas")
     parser.add_argument("--arbitro",   type=str, default=None,
-                        help="Nombre del árbitro para ajustar xFouls")
+                        help="Nombre del árbitro para ajustar xFouls y xTarjetas")
+    parser.add_argument("--jornada",   type=int, default=None,
+                        help="Jornada del partido (1-38). Si no se indica, se estima automáticamente.")
+    parser.add_argument("--cuota-local",   dest="cuota_local",   type=float, default=None,
+                        help="Cuota decimal para victoria local (ej. 2.10)")
+    parser.add_argument("--cuota-empate",  dest="cuota_empate",  type=float, default=None,
+                        help="Cuota decimal para empate (ej. 3.40)")
+    parser.add_argument("--cuota-vis",     dest="cuota_vis",     type=float, default=None,
+                        help="Cuota decimal para victoria visitante (ej. 3.20)")
+    parser.add_argument("--cuota-over25",  dest="cuota_over25",  type=float, default=None,
+                        help="Cuota decimal Over 2.5 goles (ej. 1.85)")
+    parser.add_argument("--cuota-under25", dest="cuota_under25", type=float, default=None,
+                        help="Cuota decimal Under 2.5 goles (ej. 1.95)")
+    parser.add_argument("--market-file", type=str, default=None,
+                        help="Ruta a JSON unificado de mercados (todo en un sitio)")
+    parser.add_argument("--cuota-over-faltas", type=float, default=None)
+    parser.add_argument("--cuota-under-faltas", type=float, default=None)
+    parser.add_argument("--linea-faltas", type=float, default=None)
+    parser.add_argument("--cuota-over-tarjetas", type=float, default=None)
+    parser.add_argument("--cuota-under-tarjetas", type=float, default=None)
+    parser.add_argument("--linea-tarjetas", type=float, default=None)
+    parser.add_argument("--cuota-over-corners", type=float, default=None)
+    parser.add_argument("--cuota-under-corners", type=float, default=None)
+    parser.add_argument("--linea-corners", type=float, default=None)
+    parser.add_argument("--cuota-over-tiros", type=float, default=None)
+    parser.add_argument("--cuota-under-tiros", type=float, default=None)
+    parser.add_argument("--linea-tiros", type=float, default=None)
+    parser.add_argument("--cuota-over-tiros-puerta", type=float, default=None)
+    parser.add_argument("--cuota-under-tiros-puerta", type=float, default=None)
+    parser.add_argument("--linea-tiros-puerta", type=float, default=None)
+    parser.add_argument("--cuota-over-fueras-juego", type=float, default=None)
+    parser.add_argument("--cuota-under-fueras-juego", type=float, default=None)
+    parser.add_argument("--linea-fueras-juego", type=float, default=None)
+    parser.add_argument("--local-days-since-last", type=int, default=None,
+                        help="Días desde el último partido del local")
+    parser.add_argument("--visitante-days-since-last", type=int, default=None,
+                        help="Días desde el último partido del visitante")
+    parser.add_argument("--local-days-to-next", type=int, default=None,
+                        help="Días hasta el próximo partido del local")
+    parser.add_argument("--visitante-days-to-next", type=int, default=None,
+                        help="Días hasta el próximo partido del visitante")
+    parser.add_argument("--local-last-ucl", action="store_true",
+                        help="El último partido del local fue de Champions")
+    parser.add_argument("--visitante-last-ucl", action="store_true",
+                        help="El último partido del visitante fue de Champions")
+    parser.add_argument("--local-next-ucl", action="store_true",
+                        help="El próximo partido del local es de Champions")
+    parser.add_argument("--visitante-next-ucl", action="store_true",
+                        help="El próximo partido del visitante es de Champions")
+    parser.add_argument("--local-last-competition",
+                        choices=["none", "liga", "copa", "ucl", "uel", "uecl"], default="none",
+                        help="Competición del último partido del local")
+    parser.add_argument("--visitante-last-competition",
+                        choices=["none", "liga", "copa", "ucl", "uel", "uecl"], default="none",
+                        help="Competición del último partido del visitante")
+    parser.add_argument("--local-next-competition",
+                        choices=["none", "liga", "copa", "ucl", "uel", "uecl"], default="none",
+                        help="Competición del próximo partido del local")
+    parser.add_argument("--visitante-next-competition",
+                        choices=["none", "liga", "copa", "ucl", "uel", "uecl"], default="none",
+                        help="Competición del próximo partido del visitante")
+    parser.add_argument("--local-liga-urgencia", choices=["baja", "media", "alta"], default="media",
+                        help="Urgencia competitiva liguera del local")
+    parser.add_argument("--visitante-liga-urgencia", choices=["baja", "media", "alta"], default="media",
+                        help="Urgencia competitiva liguera del visitante")
+    parser.add_argument("--local-objetivo-liga",
+                        choices=["none", "titulo", "top4", "ucl", "uel", "descenso", "salvacion", "media_tabla"],
+                        default="none",
+                        help="Objetivo real de tabla del local")
+    parser.add_argument("--visitante-objetivo-liga",
+                        choices=["none", "titulo", "top4", "ucl", "uel", "descenso", "salvacion", "media_tabla"],
+                        default="none",
+                        help="Objetivo real de tabla del visitante")
+    parser.add_argument("--local-riesgo-rotacion", choices=["bajo", "medio", "alto"], default="medio",
+                        help="Riesgo de rotación del local")
+    parser.add_argument("--visitante-riesgo-rotacion", choices=["bajo", "medio", "alto"], default="medio",
+                        help="Riesgo de rotación del visitante")
     parser.add_argument("--ingest",    choices=["stats", "possession", "all"],
                         help="Ingesta de datos: stats | possession | all")
+    parser.add_argument("--evaluar",   action="store_true",
+                        help="Backtesting del knowledge pack sobre el histórico")
+    parser.add_argument("--calibrar-agresividad", action="store_true",
+                        help="Calibra alpha_card_pressure y pesos de agresividad por volumen")
 
     args = parser.parse_args()
 
@@ -637,9 +1049,116 @@ Ejemplos:
         else:
             print(f"{GREEN}✓ Árbitro: {arbitro_resuelto}{RESET}")
 
+    # ── Cuotas ────────────────────────────────────────────────────────────────
+
+    cuotas: Optional[dict] = None
+    if args.cuota_local or args.cuota_empate or args.cuota_vis:
+        cuotas = {
+            "local":    args.cuota_local,
+            "empate":   args.cuota_empate,
+            "visitante": args.cuota_vis,
+            "over25":   args.cuota_over25,
+            "under25":  args.cuota_under25,
+        }
+        if all(v is not None for v in (args.cuota_local, args.cuota_empate, args.cuota_vis)):
+            print(f"{GREEN}✓ Cuotas 1X2: {args.cuota_local} / {args.cuota_empate} / {args.cuota_vis}{RESET}")
+        else:
+            print(f"{YELLOW}Cuotas incompletas: se necesitan las tres (local, empate, visitante).{RESET}")
+            cuotas = None
+
+    if args.jornada:
+        print(f"{GREEN}✓ Jornada: {args.jornada}{RESET}")
+
+    market_input: dict = {}
+    if args.market_file:
+        try:
+            market_input = json.loads(Path(args.market_file).read_text(encoding="utf-8"))
+            print(f"{GREEN}✓ Mercado unificado cargado desde: {args.market_file}{RESET}")
+        except Exception as e:
+            print(f"{YELLOW}No se pudo leer market-file ({e}). Se ignora.{RESET}")
+            market_input = {}
+
+    # Compat: mapear argumentos sueltos al mercado unificado.
+    if args.cuota_local and args.cuota_empate and args.cuota_vis:
+        market_input.setdefault("1x2", {})
+        market_input["1x2"].update(
+            {"local": args.cuota_local, "empate": args.cuota_empate, "visitante": args.cuota_vis}
+        )
+    if args.cuota_over25 is not None:
+        market_input.setdefault("goals_ou", {})
+        market_input["goals_ou"].update(
+            {"line": 2.5, "over": args.cuota_over25, "under": args.cuota_under25}
+        )
+
+    def _set_ou(key: str, line, over, under):
+        if over is None:
+            return
+        market_input.setdefault(key, {})
+        market_input[key].update({"line": line, "over": over, "under": under})
+
+    _set_ou("fouls_ou", args.linea_faltas, args.cuota_over_faltas, args.cuota_under_faltas)
+    _set_ou("cards_ou", args.linea_tarjetas, args.cuota_over_tarjetas, args.cuota_under_tarjetas)
+    _set_ou("corners_ou", args.linea_corners, args.cuota_over_corners, args.cuota_under_corners)
+    _set_ou("shots_ou", args.linea_tiros, args.cuota_over_tiros, args.cuota_under_tiros)
+    _set_ou(
+        "shots_on_target_ou",
+        args.linea_tiros_puerta,
+        args.cuota_over_tiros_puerta,
+        args.cuota_under_tiros_puerta,
+    )
+    _set_ou(
+        "offsides_ou",
+        args.linea_fueras_juego,
+        args.cuota_over_fueras_juego,
+        args.cuota_under_fueras_juego,
+    )
+
+    contexto_competitivo = {
+        "local": {
+            "days_since_last": args.local_days_since_last,
+            "days_to_next": args.local_days_to_next,
+            "last_ucl": args.local_last_ucl,
+            "next_ucl": args.local_next_ucl,
+            "last_competition": args.local_last_competition,
+            "next_competition": args.local_next_competition,
+            "liga_urgencia": args.local_liga_urgencia,
+            "objetivo_liga": args.local_objetivo_liga,
+            "riesgo_rotacion": args.local_riesgo_rotacion,
+        },
+        "visitante": {
+            "days_since_last": args.visitante_days_since_last,
+            "days_to_next": args.visitante_days_to_next,
+            "last_ucl": args.visitante_last_ucl,
+            "next_ucl": args.visitante_next_ucl,
+            "last_competition": args.visitante_last_competition,
+            "next_competition": args.visitante_next_competition,
+            "liga_urgencia": args.visitante_liga_urgencia,
+            "objetivo_liga": args.visitante_objetivo_liga,
+            "riesgo_rotacion": args.visitante_riesgo_rotacion,
+        },
+    }
+
     # ── Routing ───────────────────────────────────────────────────────────────
 
-    if args.arbitros:
+    if args.calibrar_agresividad:
+        print(f"{GRAY}Calibrando agresividad por volumen con histórico...{RESET}")
+        calib = calibrar_agresividad_volumen(partidos, verbose=True)
+        if calib.get("ok"):
+            print(f"{GREEN}✓ Recomendación de parámetros:{RESET}")
+            print(f"  alpha_card_pressure: {calib['best_alpha_card_pressure']}")
+            print("  agresividad_volumen:")
+            print(f"    peso_faltas: 1.0")
+            print(f"    peso_amarillas: {calib['best_peso_amarillas']}")
+            print(f"    peso_rojas: {calib['best_peso_rojas']}")
+            print(f"{GRAY}Mejora MAE: {calib['improvement_pct']}%{RESET}")
+        else:
+            print(f"{YELLOW}No fue posible calibrar: {calib.get('reason', 'sin detalle')}{RESET}")
+
+    elif args.evaluar:
+        print(f"{GRAY}Ejecutando backtesting del knowledge pack...{RESET}")
+        evaluar_knowledge(partidos, xstyles, n_ultimos=100, verbose=True)
+
+    elif args.arbitros:
         perfiles_refs = calcular_perfiles_arbitros(partidos)
         mostrar_arbitros(perfiles_refs)
 
@@ -674,7 +1193,12 @@ Ejemplos:
             print(f"Usa {BOLD}python main.py --equipos{RESET} para ver la lista numerada.\n")
             sys.exit(1)
 
-        mostrar_enfrentamiento(eq_a, eq_b, scores, rankings, xstyles, partidos, arbitro_resuelto)
+        mostrar_enfrentamiento(
+            eq_a, eq_b, scores, rankings, xstyles, partidos,
+            arbitro=arbitro_resuelto, jornada=args.jornada, cuotas=cuotas,
+            contexto_competitivo=contexto_competitivo,
+            market_input=market_input if market_input else None,
+        )
 
     elif args.equipo_a and not args.equipo_b:
         print(f"\n{RED}Debes indicar dos equipos.{RESET}")
