@@ -1,0 +1,29 @@
+# =============================================================================
+# CONFIGURACIÓN DEL MODELO DE AGRESIVIDAD — LA LIGA
+# =============================================================================
+
+# Temporadas a descargar de football-data.co.uk
+# 2023 → 23/24, 2024 → 24/25, 2025 → 25/26
+seasons:
+  - 2023
+  - 2024
+  - 2025
+
+# Decay temporal
+# λ=0.003 → un partido de hace ~1 año pesa ~33 % menos que uno de hoy
+decay_lambda: 0.003
+
+# Pesos de cada estadística en el índice de agresividad
+pesos:
+  faltas: 1.0
+  amarillas: 2.5
+  rojas: 6.0
+
+# Umbrales de riesgo disciplinario (IAP)
+umbrales:
+  alto_riesgo: 7.0
+  critico: 8.5
+
+# xFouls: coeficiente de presión de tarjetas
+# 0.0 = ignorar el efecto ; 0.4 = efecto moderado (recomendado)
+alpha_card_pressure: 0.40

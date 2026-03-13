@@ -1,2 +1,8 @@
 requests>=2.31.0
 supabase>=2.0.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Scraping (solo necesario para --scrape)
+beautifulsoup4>=4.12.0
+undetected-chromedriver>=3.5.0

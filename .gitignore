@@ -1,8 +1,13 @@
 # Credenciales y configuración local (NUNCA subir)
 config.py
+.env
 
-# Caché de datos
-cache_partidos.json
+# Resultados generados (JSON + Markdown)
+results/
+
+# Artefactos de datos anteriores
+fixture_mapping.json
+enricher_skips.json
 
 # Python
 __pycache__/
@@ -13,7 +18,6 @@ __pycache__/
 venv/
 .venv/
 env/
-.env
 
 # IDE
 .idea/
@@ -24,6 +28,4 @@ env/
 # OS
 .DS_Store
 Thumbs.db
-
-# Windows: nul es dispositivo reservado
 nul

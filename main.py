@@ -1,44 +1,43 @@
 #!/usr/bin/env python3
 """
-main.py
--------
-Script principal del Analizador de Agresividad de La Liga.
+main.py — CLI del Analizador de Agresividad de La Liga.
 
 Uso:
-  python main.py                          # Modo interactivo
-  python main.py "Athletic" "Atletico"    # Modo directo
-  python main.py --ranking                # Ver ranking completo
-  python main.py --equipos                # Listar todos los equipos disponibles
-  python main.py --arbitros               # Listar árbitros con estadísticas
-  python main.py --pull                   # Sincronizar Supabase → caché local
-  python main.py --refresh               # CSVs → Supabase → caché local
-  python main.py --enrich                # Enriquecer partidos con xG, posesión y offsides (API-Football, ~90/día)
-  python main.py --enrich-reset          # Reiniciar skips y enriquecer (reintenta fixtures fallidos)
-  python main.py --enriched              # Listar partidos que ya tienen xG/posesión rellenados
-
-Requisitos:
-  pip install requests
+  python main.py                                    # Modo interactivo (selector numerico)
+  python main.py 2 15                               # Por numero de la lista (--equipos)
+  python main.py "Athletic" "Atletico"              # Por nombre (busqueda aproximada)
+  python main.py --ranking                          # Ranking completo
+  python main.py --equipos                          # Listar equipos numerados
+  python main.py --arbitros                         # Listar arbitros
+  python main.py --ingest stats                     # CSVs -> Supabase
+  python main.py --ingest possession                # Scrape fbref -> Supabase
+  python main.py --ingest all                       # stats + possession
 """
 
+from __future__ import annotations
+
 import sys
+import re
+import json
 import argparse
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-# Forzar UTF-8 en stdout/stderr para que los emojis funcionen en CMD de Windows
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-from data_fetcher import fetch_all_data, pull_from_supabase, refresh_from_csv, get_all_team_names
-from model import calcular_scores, calcular_rankings, buscar_equipo, nivel_riesgo
-from xmodel import (
+from ingestion import fetch_all, ingest_stats, ingest_possession, ingest_all
+from model import (
+    calcular_scores, calcular_rankings, buscar_equipo, nivel_riesgo,
     calcular_xfouls, calcular_xstyle,
     calcular_perfiles_arbitros, buscar_arbitro,
     nivel_intensidad, STYLE_DIMS,
 )
 
-# ── Colores ANSI ──────────────────────────────────────────────────────────────
+# ── Colores ANSI ─────────────────────────────────────────────────────────────
 RESET   = "\033[0m"
 BOLD    = "\033[1m"
 CYAN    = "\033[96m"
@@ -52,7 +51,6 @@ BLUE    = "\033[94m"
 
 
 def barra_agresividad(score: float, ancho: int = 20) -> str:
-    """Genera una barra visual para el score (1-10)."""
     filled = int(round((score - 1) / 9 * ancho))
     filled = max(0, min(ancho, filled))
     empty = ancho - filled
@@ -78,7 +76,6 @@ def imprimir_cabecera():
 
 
 def imprimir_equipo(nombre: str, scores: dict, rankings: dict, n_equipos: int):
-    """Imprime el bloque de información de un equipo."""
     s = scores[nombre]
     r = rankings[nombre]
 
@@ -93,22 +90,18 @@ def imprimir_equipo(nombre: str, scores: dict, rankings: dict, n_equipos: int):
     print(f"{BOLD}{WHITE}  {nombre}{RESET}")
     print(f"  {GRAY}{'─' * 50}{RESET}")
 
-    # General
     print(f"  {BOLD}General  {RESET}  {barra_agresividad(g)}  "
           f"{BOLD}{g:4.1f}/10{RESET}  "
           f"{GRAY}(#{rg} de {n_equipos} en liga){RESET}")
 
-    # Local
     print(f"  {BLUE}Local    {RESET}  {barra_agresividad(lo)}  "
           f"{BOLD}{lo:4.1f}/10{RESET}  "
           f"{GRAY}(#{rlo} de {n_equipos}){RESET}")
 
-    # Visitante
     print(f"  {MAGENTA}Visitante{RESET}  {barra_agresividad(vi)}  "
           f"{BOLD}{vi:4.1f}/10{RESET}  "
           f"{GRAY}(#{rvi} de {n_equipos}){RESET}")
 
-    # Stats detalladas
     sr = s["stats_raw"]
     print(f"\n  {GRAY}Medias por partido: "
           f"{sr['faltas_media']} faltas · "
@@ -119,7 +112,6 @@ def imprimir_equipo(nombre: str, scores: dict, rankings: dict, n_equipos: int):
 
 
 def barra_dim(valor_norm: float, ancho: int = 14) -> str:
-    """Barra de progreso 1-10 para dimensiones de estilo."""
     filled = int(round((valor_norm - 1) / 9 * ancho))
     filled = max(0, min(ancho, filled))
     if valor_norm >= 7.5:
@@ -132,7 +124,6 @@ def barra_dim(valor_norm: float, ancho: int = 14) -> str:
 
 
 def imprimir_xstyle(nombre: str, profile: dict) -> None:
-    """Imprime el bloque de estilo de juego de un equipo."""
     estilo = profile.get("estilo", "—")
     desc   = profile.get("estilo_desc", "")
     norms  = profile.get("dim_norm", {})
@@ -156,13 +147,11 @@ def imprimir_xstyle(nombre: str, profile: dict) -> None:
 
 
 def imprimir_xfouls(xf: dict, equipo_a: str, equipo_b: str) -> None:
-    """Imprime el bloque de predicción de faltas esperadas."""
     sep = f"{GRAY}  {'─' * 56}{RESET}"
     print(f"\n{BOLD}{CYAN}{'═' * 58}{RESET}")
     print(f"{BOLD}{CYAN}  PREDICCIÓN DEL PARTIDO — xFouls{RESET}")
     print(f"{sep}")
 
-    # Árbitro
     arb = xf.get("arbitro")
     if arb:
         tipo_color = RED if "muy" in arb["tipo"] else (YELLOW if "estricto" in arb["tipo"] else GREEN)
@@ -213,7 +202,6 @@ def imprimir_xfouls(xf: dict, equipo_a: str, equipo_b: str) -> None:
 
 
 def mostrar_arbitros(perfiles: dict) -> None:
-    """Lista todos los árbitros con sus estadísticas."""
     print(f"\n{BOLD}Árbitros en la base de datos:{RESET}\n")
     print(f"  {BOLD}{'Árbitro':<30} {'P':>4} {'F/P':>5} {'A/P':>5} {'R/P':>5} {'Tipo':<15}{RESET}")
     print(f"  {GRAY}{'─' * 65}{RESET}")
@@ -228,51 +216,270 @@ def mostrar_arbitros(perfiles: dict) -> None:
     print()
 
 
+_RESULTS_DIR = Path(__file__).resolve().parent / "results"
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _construir_resultado(
+    equipo_a: str, equipo_b: str,
+    scores: dict, rankings: dict,
+    xstyles: dict, partidos: list,
+    arbitro: Optional[str],
+) -> dict:
+    sa = scores[equipo_a]
+    sb = scores[equipo_b]
+    ra = rankings[equipo_a]
+    rb = rankings[equipo_b]
+    n  = len(scores)
+
+    xf = calcular_xfouls(partidos, equipo_a, equipo_b, arbitro)
+    etiqueta_riesgo, _ = nivel_riesgo(sa["general_norm"], sb["general_norm"])
+    etiqueta_int, _    = nivel_intensidad(xf["xfouls_total"], xf["avg_liga"])
+
+    def equipo_dict(nombre: str, s: dict, r: dict) -> dict:
+        sr = s["stats_raw"]
+        return {
+            "nombre":       nombre,
+            "iap_general":  round(s["general_norm"], 2),
+            "iap_local":    round(s["local_norm"], 2),
+            "iap_visitante":round(s["visitante_norm"], 2),
+            "rank_general": r["rank_general"],
+            "rank_local":   r["rank_local"],
+            "rank_visitante":r["rank_visitante"],
+            "n_equipos":    n,
+            "faltas_media":   sr["faltas_media"],
+            "amarillas_media":sr["amarillas_media"],
+            "rojas_media":    sr["rojas_media"],
+            "n_partidos":   s["n_partidos"],
+            "n_local":      s["n_local"],
+            "n_visitante":  s["n_visitante"],
+        }
+
+    def style_dict(nombre: str) -> dict:
+        p = xstyles.get(nombre, {})
+        return {
+            "estilo":      p.get("estilo", "—"),
+            "estilo_desc": p.get("estilo_desc", ""),
+            "tiros":       round(p.get("tiros", 0), 1),
+            "precision":   round(p.get("precision", 0) * 100, 1),
+            "corners":     round(p.get("corners", 0), 1),
+            "goles":       round(p.get("goles", 0), 2),
+            "eficiencia":  round(p.get("eficiencia", 0) * 100, 1),
+            "faltas":      round(p.get("fouls", 0), 1),
+            "tarj_falta":  round(p.get("cards_per_foul", 0), 3),
+            "faltas_prov": round(p.get("faltas_prov", 0), 1),
+        }
+
+    diff_pct = (xf["xfouls_total"] - xf["avg_liga"]) / xf["avg_liga"] * 100
+    xf_arb = xf.get("arbitro")
+
+    return {
+        "generado":          datetime.now().isoformat(timespec="seconds"),
+        "equipo_local":      equipo_a,
+        "equipo_visitante":  equipo_b,
+        "arbitro":           arbitro,
+        "iap": {
+            "local":       equipo_dict(equipo_a, sa, ra),
+            "visitante":   equipo_dict(equipo_b, sb, rb),
+            "mas_agresivo":equipo_a if sa["general_norm"] >= sb["general_norm"] else equipo_b,
+            "diferencia":  round(abs(sa["general_norm"] - sb["general_norm"]), 2),
+            "nivel_riesgo":_strip_ansi(etiqueta_riesgo),
+        },
+        "xfouls": {
+            "base_local":          round(xf["base_local"], 1),
+            "base_visitante":      round(xf["base_visitante"], 1),
+            "xfouls_local":        round(xf["xfouls_local"], 1),
+            "xfouls_visitante":    round(xf["xfouls_visitante"], 1),
+            "total":               round(xf["xfouls_total"], 1),
+            "avg_liga":            round(xf["avg_liga"], 1),
+            "diff_pct":            round(diff_pct, 1),
+            "intensidad":          _strip_ansi(etiqueta_int),
+            "arbitro": {
+                "nombre":          xf_arb["nombre"],
+                "tipo":            xf_arb["tipo"],
+                "fouls_partido":   round(xf_arb["fouls_partido"], 2),
+                "amarillas_partido":round(xf_arb["amarillas_partido"], 2),
+                "partidos":        xf_arb["partidos"],
+            } if xf_arb else None,
+        },
+        "xstyle": {
+            "local":     style_dict(equipo_a),
+            "visitante": style_dict(equipo_b),
+        },
+    }
+
+
+def _generar_markdown(r: dict) -> str:
+    ea   = r["equipo_local"]
+    eb   = r["equipo_visitante"]
+    iap  = r["iap"]
+    xf   = r["xfouls"]
+    arb  = r["arbitro"] or "—"
+    fecha = r["generado"][:10]
+
+    ia  = iap["local"]
+    ib  = iap["visitante"]
+    sa  = r["xstyle"]["local"]
+    sb  = r["xstyle"]["visitante"]
+
+    signo = "+" if xf["diff_pct"] >= 0 else ""
+
+    lines = [
+        f"# {ea} vs {eb}  —  {fecha}",
+        "",
+        f"> Árbitro: **{arb}**",
+        "",
+        "---",
+        "",
+        "## Índice de Agresividad (IAP)",
+        "",
+        f"| | **{ea}** | **{eb}** |",
+        "|---|---:|---:|",
+        f"| General | {ia['iap_general']}/10 (#{ia['rank_general']}/{ia['n_equipos']}) | {ib['iap_general']}/10 (#{ib['rank_general']}/{ib['n_equipos']}) |",
+        f"| Local | {ia['iap_local']}/10 (#{ia['rank_local']}) | {ib['iap_local']}/10 (#{ib['rank_local']}) |",
+        f"| Visitante | {ia['iap_visitante']}/10 (#{ia['rank_visitante']}) | {ib['iap_visitante']}/10 (#{ib['rank_visitante']}) |",
+        f"| Faltas/P | {ia['faltas_media']} | {ib['faltas_media']} |",
+        f"| Amarillas/P | {ia['amarillas_media']} | {ib['amarillas_media']} |",
+        f"| Rojas/P | {ia['rojas_media']} | {ib['rojas_media']} |",
+        f"| Partidos | {ia['n_partidos']} | {ib['n_partidos']} |",
+        "",
+        f"**{iap['mas_agresivo']}** es el equipo más agresivo "
+        f"({iap['diferencia']} puntos de diferencia)",
+        "",
+        f"### {_strip_ansi(iap['nivel_riesgo'])}",
+        "",
+        "---",
+        "",
+        "## Predicción de faltas (xFouls)",
+        "",
+        f"| | |",
+        "|---|---:|",
+        f"| {ea} (local) | **{xf['xfouls_local']}** faltas |",
+        f"| {eb} (visitante) | **{xf['xfouls_visitante']}** faltas |",
+        f"| **Total esperado** | **{xf['total']} faltas** |",
+        f"| Media liga | {xf['avg_liga']} ({signo}{xf['diff_pct']:.1f}%) |",
+        f"| Intensidad | {xf['intensidad']} |",
+    ]
+
+    if xf.get("arbitro"):
+        xa = xf["arbitro"]
+        lines += [
+            "",
+            f"**Árbitro:** {xa['nombre']} — {xa['tipo'].upper()}  "
+            f"({xa['fouls_partido']} F/P · {xa['amarillas_partido']} A/P · {xa['partidos']} partidos)",
+        ]
+
+    lines += [
+        "",
+        "---",
+        "",
+        "## Estilo de juego",
+        "",
+        f"### {ea} — {sa['estilo']}",
+        f"> {sa['estilo_desc']}",
+        "",
+        f"| Dimensión | Valor |",
+        "|---|---:|",
+        f"| Tiros/P | {sa['tiros']} |",
+        f"| Precisión tiro | {sa['precision']}% |",
+        f"| Corners/P | {sa['corners']} |",
+        f"| Goles/P | {sa['goles']} |",
+        f"| Eficiencia gol | {sa['eficiencia']}% |",
+        f"| Faltas/P | {sa['faltas']} |",
+        f"| Tarjetas/Falta | {sa['tarj_falta']} |",
+        f"| Faltas provocadas | {sa['faltas_prov']} |",
+        "",
+        f"### {eb} — {sb['estilo']}",
+        f"> {sb['estilo_desc']}",
+        "",
+        f"| Dimensión | Valor |",
+        "|---|---:|",
+        f"| Tiros/P | {sb['tiros']} |",
+        f"| Precisión tiro | {sb['precision']}% |",
+        f"| Corners/P | {sb['corners']} |",
+        f"| Goles/P | {sb['goles']} |",
+        f"| Eficiencia gol | {sb['eficiencia']}% |",
+        f"| Faltas/P | {sb['faltas']} |",
+        f"| Tarjetas/Falta | {sb['tarj_falta']} |",
+        f"| Faltas provocadas | {sb['faltas_prov']} |",
+        "",
+        "---",
+        f"*Generado: {r['generado']}*",
+    ]
+    return "\n".join(lines)
+
+
+def _guardar_resultado(r: dict) -> tuple[Path, Path]:
+    _RESULTS_DIR.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    slug  = f"{r['equipo_local']}_vs_{r['equipo_visitante']}_{stamp}".replace(" ", "_")
+
+    path_json = _RESULTS_DIR / f"{slug}.json"
+    path_md   = _RESULTS_DIR / f"{slug}.md"
+
+    path_json.write_text(json.dumps(r, ensure_ascii=False, indent=2), encoding="utf-8")
+    path_md.write_text(_generar_markdown(r), encoding="utf-8")
+
+    return path_json, path_md
+
+
 def mostrar_enfrentamiento(
     equipo_a: str, equipo_b: str,
     scores: dict, rankings: dict,
     xstyles: dict, partidos: list,
     arbitro: Optional[str] = None,
 ) -> None:
-    """Muestra la comparativa completa: IAP + xStyle + xFouls."""
-    n_equipos = len(scores)
-    imprimir_cabecera()
+    resultado = _construir_resultado(equipo_a, equipo_b, scores, rankings, xstyles, partidos, arbitro)
+    path_json, path_md = _guardar_resultado(resultado)
 
-    # ── Equipo A ──────────────────────────────────────────────────────────────
-    print(f"{BOLD}{CYAN}  EQUIPO 1{RESET}")
-    imprimir_equipo(equipo_a, scores, rankings, n_equipos)
-    if equipo_a in xstyles:
-        imprimir_xstyle(equipo_a, xstyles[equipo_a])
+    iap = resultado["iap"]
+    xf  = resultado["xfouls"]
+    ia  = iap["local"]
+    ib  = iap["visitante"]
 
-    print(f"\n{GRAY}  {'─' * 56}{RESET}\n")
-
-    # ── Equipo B ──────────────────────────────────────────────────────────────
-    print(f"{BOLD}{CYAN}  EQUIPO 2{RESET}")
-    imprimir_equipo(equipo_b, scores, rankings, n_equipos)
-    if equipo_b in xstyles:
-        imprimir_xstyle(equipo_b, xstyles[equipo_b])
+    signo = "+" if xf["diff_pct"] >= 0 else ""
+    _, color_riesgo = nivel_riesgo(ia["iap_general"], ib["iap_general"])
 
     print(f"\n{BOLD}{CYAN}{'═' * 58}{RESET}")
+    print(f"{BOLD}{CYAN}  {equipo_a}  vs  {equipo_b}{RESET}")
+    print(f"{BOLD}{CYAN}{'═' * 58}{RESET}\n")
 
-    # ── Veredicto IAP ─────────────────────────────────────────────────────────
-    sa = scores[equipo_a]["general_norm"]
-    sb = scores[equipo_b]["general_norm"]
-    diff = abs(sa - sb)
-    mas_agresivo = equipo_a if sa >= sb else equipo_b
+    print(f"  {BOLD}IAP (Agresividad){RESET}")
+    print(f"  {BLUE}{equipo_a:<22}{RESET}  "
+          f"{BOLD}{ia['iap_general']:4.1f}/10{RESET}  "
+          f"L {ia['iap_local']:.1f}  V {ia['iap_visitante']:.1f}  "
+          f"{GRAY}(#{ia['rank_general']}/{ia['n_equipos']}){RESET}")
+    print(f"  {MAGENTA}{equipo_b:<22}{RESET}  "
+          f"{BOLD}{ib['iap_general']:4.1f}/10{RESET}  "
+          f"L {ib['iap_local']:.1f}  V {ib['iap_visitante']:.1f}  "
+          f"{GRAY}(#{ib['rank_general']}/{ib['n_equipos']}){RESET}")
 
-    print(f"\n{BOLD}  VEREDICTO IAP{RESET}")
-    print(f"  {BOLD}{mas_agresivo}{RESET} es el equipo más agresivo "
-          f"({diff:.1f} puntos de diferencia)")
-    etiqueta, color = nivel_riesgo(sa, sb)
-    print(f"  {color}{BOLD}{etiqueta}{RESET}")
+    print(f"\n  {color_riesgo}{BOLD}{_strip_ansi(iap['nivel_riesgo'])}{RESET}")
+    print(f"  {GRAY}{iap['mas_agresivo']} más agresivo (+{iap['diferencia']:.1f} pts){RESET}")
 
-    # ── xFouls ────────────────────────────────────────────────────────────────
-    xf = calcular_xfouls(partidos, equipo_a, equipo_b, arbitro)
-    imprimir_xfouls(xf, equipo_a, equipo_b)
+    print(f"\n  {BOLD}xFouls{RESET}")
+    print(f"  {BLUE}{equipo_a:<22}{RESET}  {xf['xfouls_local']:.1f} faltas esperadas")
+    print(f"  {MAGENTA}{equipo_b:<22}{RESET}  {xf['xfouls_visitante']:.1f} faltas esperadas")
+    print(f"  {BOLD}Total:{RESET} {xf['total']:.1f}  "
+          f"{GRAY}(liga avg {xf['avg_liga']:.1f}, {signo}{xf['diff_pct']:.0f}%){RESET}")
+    print(f"  Intensidad: {BOLD}{xf['intensidad']}{RESET}")
+
+    if xf.get("arbitro"):
+        xa = xf["arbitro"]
+        print(f"\n  {BOLD}Árbitro:{RESET} {xa['nombre']} — {xa['tipo'].upper()}")
+
+    print(f"\n{BOLD}{CYAN}{'═' * 58}{RESET}")
+    print(f"  {GREEN}✓ Guardado en:{RESET}")
+    print(f"    {path_json.relative_to(Path.cwd()) if path_json.is_relative_to(Path.cwd()) else path_json}")
+    print(f"    {path_md.relative_to(Path.cwd()) if path_md.is_relative_to(Path.cwd()) else path_md}")
+    print(f"{BOLD}{CYAN}{'═' * 58}{RESET}\n")
 
 
 def mostrar_ranking_completo(scores: dict, rankings: dict):
-    """Imprime la tabla completa de agresividad de todos los equipos."""
     imprimir_cabecera()
     print(f"{BOLD}  RANKING COMPLETO DE AGRESIVIDAD - LA LIGA{RESET}\n")
 
@@ -291,43 +498,53 @@ def mostrar_ranking_completo(scores: dict, rankings: dict):
         print(f"  {color_pos}{pos:<4}{RESET} {nombre:<30} "
               f"{BOLD}{g:>7.1f}{RESET}   {BLUE}{lo:>6.1f}{RESET}   {MAGENTA}{vi:>8.1f}{RESET}")
 
-    print(f"\n  {GRAY}General = score ponderado con decay temporal (λ={0.003}){RESET}")
+    print(f"\n  {GRAY}General = score ponderado con decay temporal (λ=0.003){RESET}")
     print(f"  {GRAY}Escala 1-10 relativa a los equipos de la liga\n{RESET}")
 
 
-def mostrar_equipos_disponibles(scores: dict):
-    """Lista todos los equipos con datos disponibles."""
-    print(f"\n{BOLD}Equipos disponibles en la base de datos:{RESET}\n")
-    equipos = sorted(scores.keys())
-    for i, equipo in enumerate(equipos, 1):
-        print(f"  {i:>2}. {equipo}")
+def _imprimir_lista_equipos(equipos: list[str]) -> None:
+    """Muestra los equipos en columnas numeradas."""
+    n = len(equipos)
+    cols = 3
+    rows = (n + cols - 1) // cols
+    col_width = 20
+
+    print(f"\n{BOLD}  Equipos disponibles:{RESET}\n")
+    for row in range(rows):
+        line = "  "
+        for col in range(cols):
+            idx = col * rows + row
+            if idx < n:
+                label = f"{idx + 1:>2}. {equipos[idx]}"
+                line += f"{CYAN}{label:<{col_width + 4}}{RESET}"
+        print(line)
     print()
 
 
+def _seleccionar_equipo(equipos: list[str], rol: str) -> str:
+    """Pide al usuario un numero y devuelve el nombre del equipo."""
+    n = len(equipos)
+    while True:
+        raw = input(f"{BOLD}  Equipo {rol} [{1}-{n}]: {RESET}").strip()
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < n:
+                equipo = equipos[idx]
+                print(f"  {GREEN}✓ {equipo}{RESET}\n")
+                return equipo
+        print(f"  {RED}Introduce un numero entre 1 y {n}.{RESET}")
+
+
+def mostrar_equipos_disponibles(scores: dict):
+    equipos = sorted(scores.keys())
+    _imprimir_lista_equipos(equipos)
+
+
 def modo_interactivo(scores: dict, rankings: dict, xstyles: dict, partidos: list):
-    """Solicita los dos equipos por teclado."""
-    equipos_disponibles = list(scores.keys())
-
-    print(f"\n{GRAY}Escribe parte del nombre del equipo (ej: 'Athletic', 'Madrid', 'Barca'){RESET}")
-
-    for numero in ["primer", "segundo"]:
-        while True:
-            nombre_input = input(f"\n{BOLD}Introduce el {numero} equipo: {RESET}").strip()
-            if not nombre_input:
-                continue
-            encontrado = buscar_equipo(nombre_input, scores)
-            if encontrado:
-                print(f"  {GREEN}✓ Equipo encontrado: {BOLD}{encontrado}{RESET}")
-                if numero == "primer":
-                    equipo_a = encontrado
-                else:
-                    equipo_b = encontrado
-                break
-            else:
-                print(f"  {RED}✗ Equipo no encontrado. Equipos disponibles:{RESET}")
-                for e in sorted(equipos_disponibles):
-                    print(f"    - {e}")
-
+    equipos = sorted(scores.keys())
+    _imprimir_lista_equipos(equipos)
+    equipo_a = _seleccionar_equipo(equipos, "local")
+    equipo_b = _seleccionar_equipo(equipos, "visitante")
     mostrar_enfrentamiento(equipo_a, equipo_b, scores, rankings, xstyles, partidos)
 
 
@@ -337,17 +554,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos:
-  python main.py                                   # Modo interactivo
-  python main.py "Athletic" "Atletico"             # Comparativa directa
-  python main.py "Getafe" "Barca" --arbitro "Gil"  # Con árbitro → xFouls ajustado
-  python main.py --ranking                         # Ranking de agresividad
-  python main.py --equipos                         # Listar equipos
-  python main.py --arbitros                        # Listar árbitros con estadísticas
-  python main.py --pull                            # Supabase → caché local
-  python main.py --refresh                         # CSVs → Supabase → caché local
-  python main.py --enrich                          # API-Football: xG, posesión, offsides (90/día)
-  python main.py --enrich-reset                    # Reiniciar skips y enriquecer de nuevo
-  python main.py --enriched                        # Ver partidos ya enriquecidos
+  python main.py                                    # Modo interactivo (selector numerico)
+  python main.py 2 15                               # Por numero de la lista (--equipos)
+  python main.py "Athletic" "Atletico"              # Por nombre (busqueda aproximada)
+  python main.py "Getafe" "Barca" --arbitro "Gil"   # Con arbitro
+  python main.py --ranking                          # Ranking de agresividad
+  python main.py --equipos                          # Listar equipos numerados
+  python main.py --arbitros                         # Listar arbitros con estadisticas
+  python main.py --ingest stats                     # CSVs -> Supabase
+  python main.py --ingest possession                # Scrape fbref -> Supabase
+  python main.py --ingest all                       # stats + possession
         """
     )
     parser.add_argument("equipo_a", nargs="?", help="Primer equipo")
@@ -357,72 +573,49 @@ Ejemplos:
     parser.add_argument("--arbitros",  action="store_true", help="Listar árbitros con estadísticas")
     parser.add_argument("--arbitro",   type=str, default=None,
                         help="Nombre del árbitro para ajustar xFouls")
-    parser.add_argument("--pull",      action="store_true",
-                        help="Descargar datos de Supabase a caché local")
-    parser.add_argument("--refresh",   action="store_true",
-                        help="Descargar CSVs, subir nuevos a Supabase y actualizar caché")
-    parser.add_argument("--enrich",    action="store_true",
-                        help="Enriquecer partidos con xG, posesión y offsides vía API-Football (límite ~90/día)")
-    parser.add_argument("--enrich-reset", action="store_true",
-                        help="Reiniciar lista de fixtures sin stats y enriquecer de nuevo")
-    parser.add_argument("--enriched", action="store_true",
-                        help="Listar partidos que ya tienen xG/posesión rellenados en Supabase")
+    parser.add_argument("--ingest",    choices=["stats", "possession", "all"],
+                        help="Ingesta de datos: stats | possession | all")
 
     args = parser.parse_args()
 
-    # ── Operaciones de datos que no necesitan el modelo ───────────────────────
-    if args.enriched:
+    # ── Ingesta de datos ─────────────────────────────────────────────────────
+
+    if args.ingest:
         try:
-            from enricher import list_enriched
-            list_enriched()
+            if args.ingest == "stats":
+                partidos = ingest_stats()
+                if partidos:
+                    print(f"{GREEN}✓ {len(partidos)} partidos en Supabase.{RESET}")
+            elif args.ingest == "possession":
+                ingest_possession()
+            elif args.ingest == "all":
+                partidos = ingest_all()
+                if partidos:
+                    print(f"{GREEN}✓ {len(partidos)} partidos en Supabase.{RESET}")
+        except ImportError as e:
+            print(f"\n{RED}Dependencia faltante para scraping: {e}{RESET}")
+            print(f"Instala: pip install undetected-chromedriver beautifulsoup4{RESET}\n")
+            sys.exit(1)
         except Exception as e:
-            print(f"\n{RED}Error: {e}{RESET}\n")
+            print(f"\n{RED}Error en ingesta: {e}{RESET}\n")
             sys.exit(1)
-        return
-
-    if args.enrich or args.enrich_reset:
-        try:
-            from enricher import run_enrich
-            run_enrich(reset_skips=args.enrich_reset)
-        except RuntimeError as e:
-            print(f"\n{RED}{e}{RESET}\n")
-            sys.exit(1)
-        except Exception as e:
-            print(f"\n{RED}Error en enricher: {e}{RESET}\n")
-            sys.exit(1)
-        return
-
-    if args.pull:
-        # --pull ahora es equivalente a correr el script normal (siempre va a Supabase)
-        # Se mantiene por compatibilidad y para forzar solo la sincronización
-        partidos = pull_from_supabase()
-        if not partidos:
-            print(f"{RED}No se pudieron obtener datos de Supabase.{RESET}")
-            sys.exit(1)
-        print(f"{GREEN}✓ {len(partidos)} partidos sincronizados desde Supabase.{RESET}")
-        return
-
-    if args.refresh:
-        partidos = refresh_from_csv()
-        if not partidos:
-            print(f"{RED}No se pudieron obtener datos.{RESET}")
-            sys.exit(1)
-        print(f"{GREEN}✓ Datos actualizados: {len(partidos)} partidos en caché local.{RESET}")
         return
 
     # ── Carga de datos para el modelo ─────────────────────────────────────────
+
     try:
-        partidos = fetch_all_data()
+        partidos = fetch_all()
     except Exception as e:
         print(f"\n{RED}Error al cargar datos: {e}{RESET}\n")
         sys.exit(1)
 
     if not partidos:
-        print(f"{YELLOW}No hay datos en caché local.{RESET}")
-        print(f"Ejecuta {BOLD}python main.py --pull{RESET} para descargar desde Supabase.")
+        print(f"{YELLOW}No hay datos disponibles.{RESET}")
+        print(f"Ejecuta {BOLD}python main.py --ingest stats{RESET} para cargar datos.")
         sys.exit(1)
 
     # ── Cálculo del modelo ────────────────────────────────────────────────────
+
     print(f"{GRAY}Calculando modelos...{RESET}", end="\r")
     scores   = calcular_scores(partidos)
     rankings = calcular_rankings(scores)
@@ -432,7 +625,8 @@ Ejemplos:
     n_equipos = len(scores)
     print(f"{GREEN}✓ {n_equipos} equipos · {len(partidos)} partidos · xStyle calculado{RESET}")
 
-    # ── Árbitro (resolución de nombre) ────────────────────────────────────────
+    # ── Árbitro ───────────────────────────────────────────────────────────────
+
     arbitro_resuelto: Optional[str] = None
     if args.arbitro:
         perfiles_refs = calcular_perfiles_arbitros(partidos)
@@ -443,7 +637,8 @@ Ejemplos:
         else:
             print(f"{GREEN}✓ Árbitro: {arbitro_resuelto}{RESET}")
 
-    # ── Routing de comandos ───────────────────────────────────────────────────
+    # ── Routing ───────────────────────────────────────────────────────────────
+
     if args.arbitros:
         perfiles_refs = calcular_perfiles_arbitros(partidos)
         mostrar_arbitros(perfiles_refs)
@@ -455,8 +650,18 @@ Ejemplos:
         mostrar_equipos_disponibles(scores)
 
     elif args.equipo_a and args.equipo_b:
-        eq_a = buscar_equipo(args.equipo_a, scores)
-        eq_b = buscar_equipo(args.equipo_b, scores)
+        equipos_ordenados = sorted(scores.keys())
+
+        def resolver(arg: str) -> Optional[str]:
+            if arg.isdigit():
+                idx = int(arg) - 1
+                if 0 <= idx < len(equipos_ordenados):
+                    return equipos_ordenados[idx]
+                return None
+            return buscar_equipo(arg, scores)
+
+        eq_a = resolver(args.equipo_a)
+        eq_b = resolver(args.equipo_b)
 
         errores = []
         if not eq_a:
@@ -466,7 +671,7 @@ Ejemplos:
 
         if errores:
             print(f"\n{RED}Equipo(s) no encontrado(s): {', '.join(errores)}{RESET}")
-            print(f"Usa {BOLD}python main.py --equipos{RESET} para ver los nombres disponibles.\n")
+            print(f"Usa {BOLD}python main.py --equipos{RESET} para ver la lista numerada.\n")
             sys.exit(1)
 
         mostrar_enfrentamiento(eq_a, eq_b, scores, rankings, xstyles, partidos, arbitro_resuelto)
@@ -477,7 +682,6 @@ Ejemplos:
         sys.exit(1)
 
     else:
-        # Modo interactivo por defecto
         modo_interactivo(scores, rankings, xstyles, partidos)
 
 

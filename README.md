@@ -2,7 +2,7 @@
 
 Herramienta de análisis estadístico para **La Liga Española** que calcula índices de agresividad, predice faltas esperadas (xFouls) y perfila el estilo de juego de cada equipo.
 
-## 📋 ¿Qué hace este proyecto?
+## ¿Qué hace este proyecto?
 
 - **IAP (Índice de Agresividad Ponderado)**: Puntúa cada equipo (1–10) según faltas, tarjetas amarillas y rojas, con ponderación temporal (partidos recientes pesan más).
 - **xFouls**: Predice las faltas esperadas en un partido concreto, teniendo en cuenta equipos, árbitro y presión de tarjetas.
@@ -10,55 +10,58 @@ Herramienta de análisis estadístico para **La Liga Española** que calcula ín
 - **Rankings**: Clasificación de agresividad general, local y visitante.
 - **Árbitros**: Estadísticas por árbitro (faltas/partido, tarjetas/partido) y clasificación (permisivo / estricto / muy estricto).
 
-Los datos se obtienen de **Supabase** (base de datos en la nube) y se pueden actualizar desde **football-data.co.uk** o enriquecer con **API-Football** (xG, posesión, offsides).
+Datos almacenados en **Supabase**. La ingesta se alimenta de **football-data.co.uk** (partidos, faltas, tarjetas, tiros) y **fbref.com** (posesión vía scraping).
 
 ---
 
-## 🚀 Instalación
+## Instalación
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### Configuración
+Copia `.env.example` a `.env` y rellena tus credenciales de Supabase:
 
-1. Copia `config.example.py` como `config.py`:
-   ```bash
-   cp config.example.py config.py
-   ```
-2. Edita `config.py` y añade tus credenciales:
-   - **Supabase**: URL y service role key (para leer/escribir partidos)
-   - **API-Football** (opcional): Para enriquecer con xG, posesión y offsides (~90 llamadas/día en plan gratuito)
+```bash
+cp .env.example .env
+```
 
 ---
 
-## 📖 Uso
+## Uso
 
 ### Comparativa entre dos equipos
+
 ```bash
 python main.py "Athletic" "Atletico"
 python main.py "Getafe" "Barca" --arbitro "Gil"
 ```
 
 ### Modo interactivo
+
 ```bash
 python main.py
 ```
 
-### Comandos útiles
+### Consultas
+
 ```bash
 python main.py --ranking      # Ranking completo de agresividad
 python main.py --equipos      # Listar equipos disponibles
 python main.py --arbitros     # Listar árbitros con estadísticas
-python main.py --pull         # Sincronizar Supabase → caché local
-python main.py --refresh      # CSVs → Supabase → caché local
-python main.py --enrich       # Enriquecer con xG, posesión (API-Football)
-python main.py --enriched     # Ver partidos ya enriquecidos
+```
+
+### Ingesta de datos
+
+```bash
+python main.py --ingest stats       # football-data.co.uk → Supabase
+python main.py --ingest possession  # Scrape fbref.com → Supabase
+python main.py --ingest all         # Ambos en secuencia
 ```
 
 ---
 
-## 📊 Ejemplo de salida
+## Ejemplo de salida
 
 ```
 ══════════════════════════════════════════════════════════
@@ -82,7 +85,7 @@ python main.py --enriched     # Ver partidos ya enriquecidos
 
 ---
 
-## 🧮 Modelo IAP
+## Modelo IAP
 
 ```
 IAP_partido = (faltas × 1.0) + (amarillas × 2.5) + (rojas × 6.0)
@@ -93,38 +96,53 @@ Score_final = normalización min-max → escala 1–10 (relativa a la liga)
 
 ---
 
-## 📁 Estructura del proyecto
+## Estructura del proyecto
 
 ```
-agressivity_stats/
-├── main.py              # CLI principal
-├── model.py             # IAP y rankings
-├── xmodel.py            # xFouls, xStyle, perfiles de árbitros
-├── data_fetcher.py      # Supabase, CSVs, caché local
-├── enricher.py          # Enriquecimiento con API-Football
-├── config.py            # Credenciales (no se sube a git)
-├── config.example.py    # Plantilla de configuración
+agressive_stats/
+├── main.py                       # CLI (presentación + routing)
+├── config.py                     # Lee .env + config.yaml
+├── config.yaml                   # Parámetros del modelo
+├── .env                          # Secretos (Supabase) — no se sube
+├── .env.example                  # Plantilla de credenciales
+│
+├── ingestion/                    # Capa de datos
+│   ├── __init__.py               # Orquestación (fetch_all, ingest_*)
+│   ├── supabase_client.py        # Conexión y CRUD Supabase
+│   ├── csv_source.py             # Descarga CSVs football-data.co.uk
+│   ├── scraper.py                # Scrape posesión desde fbref.com
+│   └── team_mapping.py           # Normalización de nombres entre fuentes
+│
+├── model/                        # Capa de modelo (cálculo puro, sin I/O)
+│   ├── __init__.py               # Reexporta API pública
+│   ├── helpers.py                # parse_date, decay_weight
+│   ├── iap.py                    # Índice de Agresividad + rankings
+│   ├── xfouls.py                 # Predicción de faltas esperadas
+│   ├── xstyle.py                 # Perfil de estilo de juego
+│   └── referees.py               # Perfilado estadístico de árbitros
+│
 ├── requirements.txt
-├── fixture_mapping.json # Mapeo de IDs API-Football
-├── supabase_migration_offsides.sql
+├── liga.bat                      # Lanzador Windows
 └── README.md
 ```
 
 ---
 
-## ⚙️ Parámetros (config.py)
+## Parámetros (config.yaml)
 
 | Parámetro | Default | Descripción |
 |-----------|---------|-------------|
-| `DECAY_LAMBDA` | `0.003` | Velocidad de decay temporal |
-| `PESO_FALTAS` | `1.0` | Peso de faltas en el IAP |
-| `PESO_AMARILLAS` | `2.5` | Peso de amarillas |
-| `PESO_ROJAS` | `6.0` | Peso de rojas |
-| `SEASONS` | `[2023, 2024, 2025]` | Temporadas a incluir |
-| `ALPHA_CARD_PRESSURE` | `0.40` | Efecto de presión de tarjetas en xFouls |
+| `decay_lambda` | `0.003` | Velocidad de decay temporal |
+| `pesos.faltas` | `1.0` | Peso de faltas en el IAP |
+| `pesos.amarillas` | `2.5` | Peso de amarillas |
+| `pesos.rojas` | `6.0` | Peso de rojas |
+| `seasons` | `[2023, 2024, 2025]` | Temporadas a incluir |
+| `alpha_card_pressure` | `0.40` | Efecto de presión de tarjetas en xFouls |
+| `umbrales.alto_riesgo` | `7.0` | Umbral IAP para riesgo alto |
+| `umbrales.critico` | `8.5` | Umbral IAP para riesgo crítico |
 
 ---
 
-## 📄 Licencia
+## Licencia
 
 Proyecto de uso personal/educativo.
